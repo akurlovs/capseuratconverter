@@ -56,9 +56,9 @@ log_warn <- function(msg) {
 #' @export
 h5ad_to_seurat <- function(h5ad_path) {
   options(Seurat.object.assay.version = "v5")
-
+  
   adata <- read_h5ad(h5ad_path)
-
+  
   if (is.null(adata$raw)) {
     # No raw layer
     log_debug("No raw layer found in h5ad file! Use assay@layers$counts=adata.X")
@@ -70,10 +70,10 @@ h5ad_to_seurat <- function(h5ad_path) {
     ) # use raw as it is wider
   } else {
     # Raw layer exists
-    log_debug("Raw layer found in h5ad file! Use assay@layers$counts=adata.raw.X, assay@layers$data=adata.X")
+    log_debug("Raw layer found in h5ad file! Use assay$counts=adata$raw, assay$data=adata$norm")
     main_assay <- SeuratObject::CreateAssay5Object(
-      counts = adata$raw$X,
-      data = adata$X
+      counts = adata$raw,
+      data = adata$norm,
     )
     log_debug("Add var as assay@meta.data")
     main_assay <- SeuratObject::AddMetaData(
@@ -89,7 +89,7 @@ h5ad_to_seurat <- function(h5ad_path) {
   for (key in names(adata$uns)) {
     SeuratObject::Misc(seurat_obj, key) <- adata$uns[[key]]
   }
-
+  
   log_debug("Add obsm section as seurat@reductions")
   for (emb in names(adata$obsm)) {
     matrix <- adata$obsm[[emb]]
@@ -159,34 +159,65 @@ read_encoding_type <- function(file, path) {
 read_sparse_matrix <- function(file, path, format, transpose = TRUE) {
   log_debug(paste0("Start read_sparse_matrix: ", path, " transpose=", transpose, "..."))
   assert(read_encoding_version(file, path), "0.1.0", "Sparse matrix must have encoding version 0.1.0")
-
+  
   shape <- unlist(read_attr(file, path, "shape"))
-  data <- rhdf5::h5read(file, paste0(path, "/data")) # non zero values
-  indices <- rhdf5::h5read(file, paste0(path, "/indices")) # column indices for csr or row indices for csc
-  indptr <- rhdf5::h5read(file, paste0(path, "/indptr")) # index pointers for csr or column pointers for csc
-
-  # Ensure indices and indptr are integers
-  indices <- as.integer(indices)
+  data <- rhdf5::h5read(file, paste0(path, "/data"), bit64conversion = "double") # non zero values
+  indices <- rhdf5::h5read(file, paste0(path, "/indices"), bit64conversion = "double") # column indices for csr or row indices for csc
+  indptr <- rhdf5::h5read(file, paste0(path, "/indptr"), bit64conversion = "double") # index pointers for csr or column pointers for csc
+  
   indptr <- as.integer(indptr)
-
-  if (!is(data, "numeric")) {
+  
+  if ( length(na.omit(indptr)) == length(indptr) ) {
+    
+    indices <- as.integer(indices)
+    
+    if (!is(data, "numeric")) {
     log_debug("data is not numeric, convert it now...")
     data <- as.numeric(data)
-  }
-
-  if (format == "csr") {
-    matrix <- Matrix::sparseMatrix(j = indices + 1, p = indptr, x = data, dims = shape)
-  } else if (format == "csc") {
-    matrix <- Matrix::sparseMatrix(i = indices + 1, p = indptr, x = data, dims = shape)
+    }
+  
+    if (format == "csr") {
+      matty <- Matrix::sparseMatrix(j = indices + 1, p = indptr, x = data, dims = shape)
+    } else if (format == "csc") {
+      matty <- Matrix::sparseMatrix(i = indices + 1, p = indptr, x = data, dims = shape)
+    } else {
+      stop(paste0("Unknown format", format))
+    }
+    
   } else {
-    stop(paste0("Unknown format", format))
+    # if there are NAs because of the bit limit, we need to rely on reticulate
+    
+    indptr <- rhdf5::h5read(file, paste0(path, "/indptr"), bit64conversion = "double") # index pointers for csr or column pointers for csc
+    
+    # Convert indptr and indices to numeric (safe for slicing)
+    indptr_num <- as.numeric(indptr)
+    indices_num <- as.numeric(indices)
+    data_num <- as.numeric(data)
+    
+    # Derive row indices (i): one row ID per nonzero entry
+    row_index <- integer(length(data))  # preallocate
+    
+    for (row in seq_len(length(indptr_num) - 1)) {
+      start <- indptr_num[row] + 1
+      end <- indptr_num[row + 1]
+      if (start <= end) {
+        row_index[start:end] <- row
+      }
+    }
+    
+    # Final i, j, x
+    i <- as.integer(row_index)         # R requires native 32-bit integer
+    j <- as.integer(indices_num + 1L)  # convert 0-based to 1-based
+    x <- data_num                      # values
+    
   }
+    
   # NOTE: The X matrix in AnnData is [n_cells x n_genes]
   # But in Seurat it must be [n_genes x n_cells]
   # So, we have to convert it in most cases
   if (transpose) {
     log_debug("transpose matrix")
-    matrix <- Matrix::t(matrix)
+    matrix <- Matrix::t(matty)
   }
   log_debug("Finish read_sparse_matrix!")
   return(matrix)
@@ -211,7 +242,7 @@ read_dense_matrix <- function(file, path, transpose) {
 get_X <- function(file, path) {
   log_info(paste0("Start get_X at path ", path, " ..."))
   encoding_type <- read_encoding_type(file, path)
-
+  
   if (encoding_type == "csr_matrix") {
     matrix <- read_sparse_matrix(file, path, "csr")
   } else if (encoding_type == "csc_matrix") {
@@ -247,12 +278,12 @@ read_df_col_str_array <- function(file, path) {
 
 read_df_col_cat <- function(file, path) {
   log_debug(paste0("Start read_df_col_cat: ", path, "..."))
-
+  
   assert(read_encoding_version(file, path), "0.2.0", "The encoding version of <categorical> must be 0.2.0")
-
+  
   code_key <- paste0(path, "/codes")
   cat_key <- paste0(path, "/categories")
-
+  
   codes <- rhdf5::h5read(file, code_key)
   categories <- rhdf5::h5read(file, cat_key)
   # codes is a vector from 0 to n_categories - 1
@@ -266,7 +297,7 @@ read_df_col <- function(file, path) {
   # Assumes that column exists in the file
   # make check before the call!
   col_type <- read_encoding_type(file, path)
-
+  
   if (col_type == "array") {
     col <- read_df_col_array(file, path)
   } else if (col_type == "categorical") {
@@ -286,20 +317,20 @@ read_df <- function(file, path) {
   # Code assumes that df exists, so check it before call the funciton!
   assert(read_encoding_type(file, path), "dataframe", "The encoding type of AnnData file must be dataframe")
   assert(read_encoding_version(file, path), "0.2.0", "The encoding version of AnnData file must be 0.2.0")
-
+  
   index_col <- read_attr(file, path, "_index")
   col_order <- read_attr(file, path, "column-order")
   col_order <- unlist(col_order)
-
+  
   index <- read_df_col(file, paste0(path, "/", index_col))
   df <- data.frame(row.names = index)
-
+  
   for (col in col_order) {
     col_path <- paste0(path, "/", col)
     col_values <- read_df_col(file, col_path)
     df <- cbind(df, col = col_values)
   }
-
+  
   colnames(df) <- col_order
   log_debug("Finish read_df!")
   return(df)
@@ -344,13 +375,13 @@ get_obsm <- function(file) {
   path <- "/obsm"
   assert(read_encoding_type(file, path), "dict", "The encoding type of AnnData obsm section must be <dict>")
   assert(read_encoding_version(file, path), "0.1.0", "The encoding version of AnnData <dict> must be 0.1.0")
-
+  
   obsm_group <- rhdf5::H5Gopen(file, path)
   on.exit(rhdf5::H5Gclose(obsm_group))
-
+  
   obsm_list <- rhdf5::h5ls(obsm_group, recursive = FALSE)
   obsm <- list()
-
+  
   for (emb_name in obsm_list[["name"]]) {
     emb_path <- paste0(path, "/", emb_name)
     type <- read_encoding_type(file, emb_path)
@@ -370,33 +401,28 @@ get_obsm <- function(file) {
 }
 
 
-get_raw_X_var <- function(file) {
+get_raw_log_X <- function(file, pattern) {
   log_info("Start get_raw_X_var ...")
-  path <- "/raw"
-
-  raw_group <- NULL
-
-  # TODO: perhaps it is better to explicitly get the list of entiities in the file and check if the raw exists
-  tryCatch(
-    {
-      raw_group <- rhdf5::H5Gopen(file, path)
-      on.exit(rhdf5::H5Gclose(raw_group))
-    },
-    error = function(e) {
-      log_info("No raw data found")
-    }
-  )
-
-  # If 'raw_group' is NULL, return early
-  if (is.null(raw_group)) {
-    return(raw_group)
+  path <- "/layers"
+  
+  layers_group <- rhdf5::H5Gopen(file, path)
+  on.exit(rhdf5::H5Gclose(layers_group))
+  
+  layer_path <- paste0(path, "/", pattern)
+  encoding_type <- read_encoding_type(file,  layer_path)
+  
+  if (encoding_type == "csr_matrix") {
+    matrix <- read_sparse_matrix(file, layer_path, "csr")
+  } else if (encoding_type == "csc_matrix") {
+    matrix <- read_sparse_matrix(file, layer_path, "csc")
+  } else if (encoding_type == "array") {
+    matrix <- read_dense_matrix(file, path, transpose=TRUE)
+  } else {
+    stop(paste0("Unknown encoding type", encoding_type))
   }
-
-  raw.X <- get_X(file, paste0(path, "/X"))
-  raw.var <- get_var(file, layer = "raw")
-  res <- list(X = raw.X, var = raw.var)
-  log_info("Finish get_raw_X_var!")
-  return(res)
+  
+  log_info(sprintf("Finish get_raw_log_X with %s!", pattern))
+  return(matrix)
 }
 
 
@@ -404,27 +430,29 @@ read_mapping <- function(file, path, transpose) {
   # Function assumes that the mapping exists in the file
   # Check it before the call!
   log_debug(paste0("Start read_mapping: ", path, "..."))
-
+  
   assert(read_encoding_type(file, path), "dict", paste0("The encoding type of AnnData mapping section ", path, " must be <dict>"))
   assert(read_encoding_version(file, path), "0.1.0", paste0("The encoding version of AnnData <dict> ", path, " must be 0.1.0"))
-
+  
   group <- rhdf5::H5Gopen(file, path)
   on.exit(rhdf5::H5Gclose(group))
-
+  
   # recursively read all element in the group
-
+  
   elements <- rhdf5::h5ls(group, recursive = FALSE)[["name"]]
   result <- list()
-
+  
   for (element in elements) {
     element_path <- paste0(path, "/", element)
     element_type <- read_encoding_type(file, element_path)
     log_debug(paste0("Read element: ", element, " with type: ", element_type))
     if (element_type == "dict") {
-      values <- read_mapping(file, element_path, transpose = transpose)
+      values <- read_mapping(file, element_path, transpose=transpose)
     } else if (element_type == "dataframe") {
       values <- read_df(file, element_path)
     } else if (element_type == "array") {
+      values <- read_dense_matrix(file, element_path, transpose = transpose)
+    } else if (element_type == "rec-array") {
       values <- read_dense_matrix(file, element_path, transpose = transpose)
     } else if (element_type == "csr_matrix") {
       values <- read_sparse_matrix(file, element_path, "csr", transpose = transpose)
@@ -444,42 +472,15 @@ read_mapping <- function(file, path, transpose) {
   return(result)
 }
 
-get_layers <- function(file) {
-  log_info("Start get_layers ...")
-  path <- "/layers"
-  layers_group <- NULL
-
-  # TODO: perhaps it is better to explicitly get the list of entiities in the file and check if the layers exists
-  tryCatch(
-    {
-      layers_group <- rhdf5::H5Gopen(file, path)
-      on.exit(rhdf5::H5Gclose(layers_group))
-    },
-    error = function(e) {
-      log_info("No layers data found")
-    }
-  )
-
-  if (is.null(layers_group)) {
-    return(NaN)
-  }
-
-  assert(read_encoding_type(file, path), "dict", "The encoding type of AnnData layers section must be <dict>")
-  assert(read_encoding_version(file, path), "0.1.0", "The encoding version of AnnData <dict> must be 0.1.0")
-
-  result <- read_mapping(file, path, transpose = TRUE)
-  log_info("Finish get_layers!")
-  return(result)
-}
 
 
 get_uns <- function(file) {
   log_info("Start get_uns ...")
   path <- "/uns"
-
+  
   assert(read_encoding_type(file, path), "dict", "The encoding type of AnnData uns section must be <dict>")
   assert(read_encoding_version(file, path), "0.1.0", "The encoding version of AnnData <dict> must be 0.1.0")
-
+  
   result <- read_mapping(file, path, transpose = FALSE)
   log_info("Finish get_uns!")
   return(result)
@@ -490,27 +491,31 @@ read_h5ad <- function(path) {
   log_info(paste0("Start read_h5ad: path=", path, " ..."))
   f <- rhdf5::H5Fopen(path)
   on.exit(rhdf5::H5Fclose(f))
-
+  
   assert(read_encoding_version(f, "/"), "0.1.0", "The encoding version of AnnData file must be 0.1.0")
   assert(read_encoding_type(f, "/"), "anndata", "The encoding type of AnnData file must be anndata")
-
-  x <- get_X(f, "/X")
+  
+  #x <- get_X(f, "/X")
   obs <- get_obs(f)
   var <- get_var(f)
-  rownames(x) <- rownames(var)
-  colnames(x) <- rownames(obs)
-  log_debug("Rownames and colnames for X data updated")
+  #rownames(x) <- rownames(var)
+  #colnames(x) <- rownames(obs)
+  #log_debug("Rownames and colnames for X data updated")
   obsm <- get_obsm(f)
-  raw <- get_raw_X_var(f)
-  if (!is.null(raw)) {
-    log_debug("Update rownames and colnames for raw data")
-    rownames(raw$X) <- rownames(raw$var)
-    colnames(raw$X) <- rownames(obs)
-  }
-  layers <- get_layers(f)
+  
+  raw <- get_raw_log_X(f, pattern="counts")
+  log_debug("Update rownames and colnames for raw data")
+  rownames(raw) <- rownames(var)
+  colnames(raw) <- rownames(obs)
+  
+  norm <- get_raw_log_X(f, pattern="norm_counts")
+  log_debug("Update rownames and colnames for raw data")
+  rownames(norm) <- rownames(var)
+  colnames(norm) <- rownames(obs)
+  
   uns <- get_uns(f)
-
-  anndata <- list(X=x, obs=obs, var=var, obsm=obsm, raw=raw, layers=layers, uns=uns)
+  
+  anndata <- list(raw=raw, norm=norm, obs=obs, var=var, obsm=obsm, uns=uns)
   log_info("Finish read_h5ad!")
   return(anndata)
 }
